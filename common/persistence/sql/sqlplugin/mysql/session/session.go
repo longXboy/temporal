@@ -142,7 +142,7 @@ func buildDSNAttrs(dbKind sqlplugin.DbKind, cfg *config.SQL) (map[string]string,
 	// only override isolation level if not specified
 	if !hasAttr(attrs, isolationLevelAttrName) &&
 		!hasAttr(attrs, isolationLevelAttrNameLegacy) {
-		attrs[isolationLevelAttrName] = defaultIsolationLevel
+		attrs[isolationLevelAttrNameLegacy] = defaultIsolationLevel
 	}
 
 	// these attrs are always overriden
