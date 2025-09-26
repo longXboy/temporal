@@ -853,6 +853,7 @@ var (
 	ActivityCancel                                       = NewCounterDef("activity_cancel")
 	ActivityTaskTimeout                                  = NewCounterDef("activity_task_timeout", WithDescription("Number of activity task timeouts (including retries)."))
 	ActivityTimeout                                      = NewCounterDef("activity_timeout", WithDescription("Number of terminal activity timeouts."))
+	ActivityPayloadSize                                  = NewCounterDef("activity_payload_size", WithDescription("Size of activity payloads in bytes."))
 	AckLevelUpdateCounter                                = NewCounterDef("ack_level_update")
 	AckLevelUpdateFailedCounter                          = NewCounterDef("ack_level_update_failed")
 	CommandCounter                                       = NewCounterDef("command")
@@ -1026,6 +1027,11 @@ var (
 	DLQMessageCount = NewGaugeDef(
 		"dlq_message_count",
 		WithDescription("The number of messages currently in DLQ."),
+	)
+	DataLossCounter = NewCounterDef(
+		"data_loss_errors",
+		WithDescription("Total number of data loss errors encountered. This is a high cardinality metrics that has namespace, workflowID and runID tags."+
+			"It is only emitted when system.enableDataLossMetrics is enabled. Only enable this if metrics system can handle it's cardinality"),
 	)
 	ReadNamespaceErrors                     = NewCounterDef("read_namespace_errors")
 	RateLimitedTaskRunnableWaitTime         = NewTimerDef("rate_limited_task_runnable_wait_time")
