@@ -43,6 +43,7 @@ import (
 	"go.temporal.io/server/common/cluster"
 	dc "go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/headers"
+	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/payload"
 	"go.temporal.io/server/common/payloads"
@@ -844,10 +845,12 @@ func (s *WorkflowHandlerSuite) TestStartWorkflowExecution_Failed_InvalidAggregat
 	s.mockSearchAttributesMapperProvider.EXPECT().GetMapper(gomock.Any()).AnyTimes().Return(nil, nil)
 	config := s.newConfig()
 	config.MaxLinksPerRequest = dc.GetIntPropertyFnFilteredByNamespace(10)
-	config.CallbackEndpointConfigs = dc.GetTypedPropertyFnFilteredByNamespace([]callbacks.AddressMatchRule{
-		{
-			Regexp:        regexp.MustCompile(`.*`),
-			AllowInsecure: true,
+	config.CallbackEndpointConfigs = dc.GetTypedPropertyFnFilteredByNamespace(callbacks.AddressMatchRules{
+		Rules: []callbacks.AddressMatchRule{
+			{
+				Regexp:        regexp.MustCompile(`.*`),
+				AllowInsecure: true,
+			},
 		},
 	})
 	wh := s.getWorkflowHandler(config)
@@ -2130,6 +2133,7 @@ func (s *WorkflowHandlerSuite) TestCountWorkflowExecutions() {
 }
 
 func (s *WorkflowHandlerSuite) TestVerifyHistoryIsComplete() {
+	logger := log.NewTestLogger()
 	events := make([]*historyspb.StrippedHistoryEvent, 50)
 	for i := 0; i < len(events); i++ {
 		events[i] = &historyspb.StrippedHistoryEvent{EventId: int64(i + 1)}
@@ -2174,6 +2178,7 @@ func (s *WorkflowHandlerSuite) TestVerifyHistoryIsComplete() {
 
 	for i, tc := range testCases {
 		err := api.VerifyHistoryIsComplete(
+			logger,
 			tc.events[0],
 			tc.events[len(tc.events)-1],
 			len(tc.events),
@@ -2239,7 +2244,7 @@ func (s *WorkflowHandlerSuite) TestStartBatchOperation_Terminate() {
 			_ ...grpc.CallOption,
 		) (*historyservice.StartWorkflowExecutionResponse, error) {
 			s.Equal(namespaceID.String(), request.NamespaceId)
-			s.Equal(batcher.BatchWFTypeProtobufName, request.StartRequest.WorkflowType.Name)
+			s.Equal(batcher.BatchWFTypeName, request.StartRequest.WorkflowType.Name)
 			s.Equal(primitives.PerNSWorkerTaskQueue, request.StartRequest.TaskQueue.Name)
 			s.Equal(enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE, request.StartRequest.WorkflowIdReusePolicy)
 			s.Equal(inputString, request.StartRequest.Identity)
@@ -2300,7 +2305,7 @@ func (s *WorkflowHandlerSuite) TestStartBatchOperation_Cancellation() {
 			_ ...grpc.CallOption,
 		) (*historyservice.StartWorkflowExecutionResponse, error) {
 			s.Equal(namespaceID.String(), request.NamespaceId)
-			s.Equal(batcher.BatchWFTypeProtobufName, request.StartRequest.WorkflowType.Name)
+			s.Equal(batcher.BatchWFTypeName, request.StartRequest.WorkflowType.Name)
 			s.Equal(primitives.PerNSWorkerTaskQueue, request.StartRequest.TaskQueue.Name)
 			s.Equal(enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE, request.StartRequest.WorkflowIdReusePolicy)
 			s.Equal(inputString, request.StartRequest.Identity)
@@ -2364,7 +2369,7 @@ func (s *WorkflowHandlerSuite) TestStartBatchOperation_Signal() {
 			_ ...grpc.CallOption,
 		) (*historyservice.StartWorkflowExecutionResponse, error) {
 			s.Equal(namespaceID.String(), request.NamespaceId)
-			s.Equal(batcher.BatchWFTypeProtobufName, request.StartRequest.WorkflowType.Name)
+			s.Equal(batcher.BatchWFTypeName, request.StartRequest.WorkflowType.Name)
 			s.Equal(primitives.PerNSWorkerTaskQueue, request.StartRequest.TaskQueue.Name)
 			s.Equal(enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE, request.StartRequest.WorkflowIdReusePolicy)
 			s.Equal(inputString, request.StartRequest.Identity)
@@ -2438,7 +2443,7 @@ func (s *WorkflowHandlerSuite) TestStartBatchOperation_WorkflowExecutions_Signal
 			_ ...grpc.CallOption,
 		) (*historyservice.StartWorkflowExecutionResponse, error) {
 			s.Equal(namespaceID.String(), request.NamespaceId)
-			s.Equal(batcher.BatchWFTypeProtobufName, request.StartRequest.WorkflowType.Name)
+			s.Equal(batcher.BatchWFTypeName, request.StartRequest.WorkflowType.Name)
 			s.Equal(primitives.PerNSWorkerTaskQueue, request.StartRequest.TaskQueue.Name)
 			s.Equal(enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE, request.StartRequest.WorkflowIdReusePolicy)
 			s.Equal(identity, request.StartRequest.Identity)
@@ -2496,7 +2501,7 @@ func (s *WorkflowHandlerSuite) TestStartBatchOperation_WorkflowExecutions_Reset(
 			_ ...grpc.CallOption,
 		) (*historyservice.StartWorkflowExecutionResponse, error) {
 			s.Equal(namespaceID.String(), request.NamespaceId)
-			s.Equal(batcher.BatchWFTypeProtobufName, request.StartRequest.WorkflowType.Name)
+			s.Equal(batcher.BatchWFTypeName, request.StartRequest.WorkflowType.Name)
 			s.Equal(primitives.PerNSWorkerTaskQueue, request.StartRequest.TaskQueue.Name)
 			s.Equal(enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE, request.StartRequest.WorkflowIdReusePolicy)
 			s.Equal(identity, request.StartRequest.Identity)
@@ -2560,7 +2565,7 @@ func (s *WorkflowHandlerSuite) TestStartBatchOperation_WorkflowExecutions_Reset_
 			_ ...grpc.CallOption,
 		) (*historyservice.StartWorkflowExecutionResponse, error) {
 			s.Equal(namespaceID.String(), request.NamespaceId)
-			s.Equal(batcher.BatchWFTypeProtobufName, request.StartRequest.WorkflowType.Name)
+			s.Equal(batcher.BatchWFTypeName, request.StartRequest.WorkflowType.Name)
 			s.Equal(primitives.PerNSWorkerTaskQueue, request.StartRequest.TaskQueue.Name)
 			s.Equal(enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE, request.StartRequest.WorkflowIdReusePolicy)
 			s.Equal(identity, request.StartRequest.Identity)

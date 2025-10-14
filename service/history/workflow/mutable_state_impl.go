@@ -55,6 +55,7 @@ import (
 	"go.temporal.io/server/common/primitives/timestamp"
 	"go.temporal.io/server/common/searchattribute"
 	serviceerrors "go.temporal.io/server/common/serviceerror"
+	"go.temporal.io/server/common/softassert"
 	"go.temporal.io/server/common/util"
 	"go.temporal.io/server/common/worker_versioning"
 	"go.temporal.io/server/components/callbacks"
@@ -213,7 +214,17 @@ type (
 
 		InsertTasks map[tasks.Category][]tasks.Task
 
+		// BestEffortDeleteTasks holds keys of history tasks to be deleted after a successful
+		// persistence update. This deletion is done on best effort basis. Persistence layer can ignore it without
+		// any errors.
+		BestEffortDeleteTasks map[tasks.Category][]tasks.Key
+
 		speculativeWorkflowTaskTimeoutTask *tasks.WorkflowTaskTimeoutTask
+
+		// In-memory storage for workflow task timeout tasks. These are set when timeout tasks are
+		// generated and used to delete them when the workflow task completes. Not persisted to storage.
+		wftScheduleToStartTimeoutTask *tasks.WorkflowTaskTimeoutTask
+		wftStartToCloseTimeoutTask    *tasks.WorkflowTaskTimeoutTask
 
 		// Do not rely on this, this is only updated on
 		// Load() and closeTransactionXXX methods. So when
@@ -299,6 +310,7 @@ func NewMutableState(
 		namespaceEntry:               namespaceEntry,
 		appliedEvents:                make(map[string]struct{}),
 		InsertTasks:                  make(map[tasks.Category][]tasks.Task),
+		BestEffortDeleteTasks:        make(map[tasks.Category][]tasks.Key),
 		transitionHistoryEnabled:     shard.GetConfig().EnableTransitionHistory(),
 		visibilityUpdated:            false,
 		executionStateUpdated:        false,
@@ -1820,7 +1832,9 @@ func (ms *MutableStateImpl) UpdateActivityProgress(
 
 	if payloadSize := request.Details.Size(); payloadSize > 0 {
 		ms.metricsHandler.Counter(metrics.ActivityPayloadSize.Name()).Record(
-			int64(payloadSize), metrics.OperationTag(metrics.HistoryRecordActivityTaskHeartbeatScope))
+			int64(payloadSize),
+			metrics.OperationTag(metrics.HistoryRecordActivityTaskHeartbeatScope),
+			metrics.NamespaceTag(ms.namespaceEntry.Name().String()))
 	}
 }
 
@@ -3416,7 +3430,7 @@ func (ms *MutableStateImpl) AddActivityTaskScheduledEvent(
 		return nil, nil, ms.createCallerError(opTag, "ActivityID: "+command.GetActivityId())
 	}
 
-	event := ms.hBuilder.AddActivityTaskScheduledEvent(workflowTaskCompletedEventID, command)
+	event := ms.hBuilder.AddActivityTaskScheduledEvent(workflowTaskCompletedEventID, command, ms.namespaceEntry.Name())
 	ai, err := ms.ApplyActivityTaskScheduledEvent(workflowTaskCompletedEventID, event)
 	// TODO merge active & passive task generation
 	if !bypassTaskGeneration {
@@ -3701,6 +3715,7 @@ func (ms *MutableStateImpl) AddActivityTaskCompletedEvent(
 		startedEventID,
 		request.Identity,
 		request.Result,
+		ms.namespaceEntry.Name(),
 	)
 	if err := ms.ApplyActivityTaskCompletedEvent(event); err != nil {
 		return nil, err
@@ -3750,6 +3765,7 @@ func (ms *MutableStateImpl) AddActivityTaskFailedEvent(
 		failure,
 		retryState,
 		identity,
+		ms.namespaceEntry.Name(),
 	)
 	if err := ms.ApplyActivityTaskFailedEvent(event); err != nil {
 		return nil, err
@@ -5882,6 +5898,130 @@ func (ms *MutableStateImpl) updatePauseInfoSearchAttribute() error {
 	return ms.taskGenerator.GenerateUpsertVisibilityTask()
 }
 
+func (ms *MutableStateImpl) UpdateReportedProblemsSearchAttribute() error {
+	var reportedProblems []string
+	switch wftFailure := ms.executionInfo.LastWorkflowTaskFailure.(type) {
+	case *persistencespb.WorkflowExecutionInfo_LastWorkflowTaskFailureCause:
+		reportedProblems = []string{
+			"category=WorkflowTaskFailed",
+			fmt.Sprintf("cause=WorkflowTaskFailedCause%s", wftFailure.LastWorkflowTaskFailureCause.String()),
+		}
+	case *persistencespb.WorkflowExecutionInfo_LastWorkflowTaskTimedOutType:
+		reportedProblems = []string{
+			"category=WorkflowTaskTimedOut",
+			fmt.Sprintf("cause=WorkflowTaskTimedOutCause%s", wftFailure.LastWorkflowTaskTimedOutType.String()),
+		}
+	}
+
+	reportedProblemsPayload, err := searchattribute.EncodeValue(reportedProblems, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST)
+	if err != nil {
+		return err
+	}
+
+	exeInfo := ms.executionInfo
+	if exeInfo.SearchAttributes == nil {
+		exeInfo.SearchAttributes = make(map[string]*commonpb.Payload, 1)
+	}
+
+	decodedA, err := searchattribute.DecodeValue(exeInfo.SearchAttributes[searchattribute.TemporalReportedProblems], enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST, false)
+	if err != nil {
+		return err
+	}
+
+	existingProblems, ok := decodedA.([]string)
+	if !ok && decodedA != nil {
+		softassert.Fail(ms.logger, "TemporalReportedProblems payload decoded to unexpected type for logging")
+		return errors.New("TemporalReportedProblems payload decoded to unexpected type for logging")
+	}
+
+	if slices.Equal(existingProblems, reportedProblems) {
+		return nil
+	}
+
+	// Log the search attribute change
+	ms.logReportedProblemsChange(existingProblems, reportedProblems)
+
+	ms.updateSearchAttributes(map[string]*commonpb.Payload{searchattribute.TemporalReportedProblems: reportedProblemsPayload})
+	return ms.taskGenerator.GenerateUpsertVisibilityTask()
+}
+
+func (ms *MutableStateImpl) RemoveReportedProblemsSearchAttribute() error {
+	if ms.executionInfo.SearchAttributes == nil {
+		return nil
+	}
+
+	temporalReportedProblems := ms.executionInfo.SearchAttributes[searchattribute.TemporalReportedProblems]
+	if temporalReportedProblems == nil {
+		return nil
+	}
+
+	// Log the removal of the search attribute
+	ms.logReportedProblemsChange(ms.decodeReportedProblems(temporalReportedProblems), nil)
+
+	ms.executionInfo.LastWorkflowTaskFailure = nil
+
+	// Just remove the search attribute entirely for now
+	ms.updateSearchAttributes(map[string]*commonpb.Payload{searchattribute.TemporalReportedProblems: nil})
+	return ms.taskGenerator.GenerateUpsertVisibilityTask()
+}
+
+// logReportedProblemsChange logs changes to the TemporalReportedProblems search attribute
+func (ms *MutableStateImpl) logReportedProblemsChange(oldPayload, newPayload []string) {
+	if oldPayload == nil && newPayload != nil {
+		// Adding search attribute
+		ms.logger.Info("TemporalReportedProblems search attribute added",
+			tag.WorkflowNamespaceID(ms.executionInfo.NamespaceId),
+			tag.WorkflowID(ms.executionInfo.WorkflowId),
+			tag.WorkflowRunID(ms.executionState.RunId),
+			tag.NewStringsTag("reported-problems", newPayload))
+	} else if oldPayload != nil && newPayload == nil {
+		// Removing search attribute
+		ms.logger.Info("TemporalReportedProblems search attribute removed",
+			tag.WorkflowNamespaceID(ms.executionInfo.NamespaceId),
+			tag.WorkflowID(ms.executionInfo.WorkflowId),
+			tag.WorkflowRunID(ms.executionState.RunId),
+			tag.NewStringsTag("previous-reported-problems", oldPayload))
+	} else if oldPayload != nil && newPayload != nil {
+		// Updating search attribute
+		ms.logger.Info("TemporalReportedProblems search attribute updated",
+			tag.WorkflowNamespaceID(ms.executionInfo.NamespaceId),
+			tag.WorkflowID(ms.executionInfo.WorkflowId),
+			tag.WorkflowRunID(ms.executionState.RunId),
+			tag.NewStringsTag("previous-reported-problems", oldPayload),
+			tag.NewStringsTag("reported-problems", newPayload))
+	}
+}
+
+// decodeReportedProblems safely decodes a keyword list payload to []string
+func (ms *MutableStateImpl) decodeReportedProblems(p *commonpb.Payload) []string {
+	if p == nil {
+		return nil
+	}
+
+	decoded, err := searchattribute.DecodeValue(p, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST, false)
+	if err != nil {
+		ms.logger.Error("Failed to decode TemporalReportedProblems payload for logging",
+			tag.WorkflowNamespaceID(ms.executionInfo.NamespaceId),
+			tag.WorkflowID(ms.executionInfo.WorkflowId),
+			tag.WorkflowRunID(ms.executionState.RunId),
+			tag.Error(err))
+		softassert.Fail(ms.logger, "Failed to decode TemporalReportedProblems payload for logging")
+		return []string{}
+	}
+
+	problems, ok := decoded.([]string)
+	if !ok {
+		ms.logger.Error("TemporalReportedProblems payload decoded to unexpected type for logging",
+			tag.WorkflowNamespaceID(ms.executionInfo.NamespaceId),
+			tag.WorkflowID(ms.executionInfo.WorkflowId),
+			tag.WorkflowRunID(ms.executionState.RunId))
+		softassert.Fail(ms.logger, "TemporalReportedProblems payload decoded to unexpected type for logging")
+		return []string{}
+	}
+
+	return problems
+}
+
 func (ms *MutableStateImpl) truncateRetryableActivityFailure(
 	activityFailure *failurepb.Failure,
 ) *failurepb.Failure {
@@ -6001,6 +6141,22 @@ func (ms *MutableStateImpl) RemoveSpeculativeWorkflowTaskTimeoutTask() {
 		ms.speculativeWorkflowTaskTimeoutTask.Cancel()
 		ms.speculativeWorkflowTaskTimeoutTask = nil
 	}
+}
+
+func (ms *MutableStateImpl) SetWorkflowTaskScheduleToStartTimeoutTask(task *tasks.WorkflowTaskTimeoutTask) {
+	ms.wftScheduleToStartTimeoutTask = task
+}
+
+func (ms *MutableStateImpl) SetWorkflowTaskStartToCloseTimeoutTask(task *tasks.WorkflowTaskTimeoutTask) {
+	ms.wftStartToCloseTimeoutTask = task
+}
+
+func (ms *MutableStateImpl) GetWorkflowTaskScheduleToStartTimeoutTask() *tasks.WorkflowTaskTimeoutTask {
+	return ms.wftScheduleToStartTimeoutTask
+}
+
+func (ms *MutableStateImpl) GetWorkflowTaskStartToCloseTimeoutTask() *tasks.WorkflowTaskTimeoutTask {
+	return ms.wftStartToCloseTimeoutTask
 }
 
 func (ms *MutableStateImpl) GetWorkflowStateStatus() (enumsspb.WorkflowExecutionState, enumspb.WorkflowExecutionStatus) {
@@ -6128,7 +6284,8 @@ func (ms *MutableStateImpl) CloseTransactionAsMutation(
 		NewBufferedEvents:         result.bufferEvents,
 		ClearBufferedEvents:       result.clearBuffer,
 
-		Tasks: ms.InsertTasks,
+		Tasks:                 ms.InsertTasks,
+		BestEffortDeleteTasks: ms.BestEffortDeleteTasks,
 
 		Condition:       ms.nextEventIDInDB,
 		DBRecordVersion: ms.dbRecordVersion,
@@ -6891,6 +7048,7 @@ func (ms *MutableStateImpl) cleanupTransaction() error {
 	)
 
 	ms.InsertTasks = make(map[tasks.Category][]tasks.Task)
+	ms.BestEffortDeleteTasks = make(map[tasks.Category][]tasks.Key)
 
 	// Clear outputs for the next transaction.
 	ms.stateMachineNode.ClearTransactionState()
