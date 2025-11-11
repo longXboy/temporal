@@ -41,6 +41,10 @@ type (
 		// and the metric name, while opentelemetry implementation only adds it if it's not already there.
 		Prefix string `yaml:"prefix"`
 
+		// AllowedMetrics is a list of metric names that should be emitted.
+		// If empty or nil, all metrics will be emitted.
+		AllowedMetrics []string `yaml:"allowedMetrics"`
+
 		// DefaultHistogramBoundaries defines the default histogram bucket
 		// boundaries.
 		// Configuration of histogram boundaries for given metric unit.
@@ -463,6 +467,7 @@ func MetricsHandlerFromConfig(logger log.Logger, c *Config) (Handler, error) {
 
 	setDefaultPerUnitHistogramBoundaries(&c.ClientConfig)
 
+	var handler Handler
 	fatalOnListenerError := true
 	if c.Statsd != nil && c.Statsd.Framework == FrameworkOpentelemetry {
 		// create opentelemetry provider with just statsd
@@ -470,23 +475,42 @@ func MetricsHandlerFromConfig(logger log.Logger, c *Config) (Handler, error) {
 		if err != nil {
 			logger.Fatal(err.Error())
 		}
-		return NewOtelMetricsHandler(logger, otelProvider, c.ClientConfig, false)
-	}
-
-	if c.Prometheus != nil && c.Prometheus.Framework == FrameworkOpentelemetry {
+		handler, err = NewOtelMetricsHandler(logger, otelProvider, c.ClientConfig, false)
+		if err != nil {
+			return nil, err
+		}
+	} else if c.Prometheus != nil && c.Prometheus.Framework == FrameworkOpentelemetry {
 		// create opentelemetry provider with just prometheus
 		otelProvider, err := NewOpenTelemetryProviderWithPrometheus(logger, c.Prometheus, &c.ClientConfig, fatalOnListenerError)
 		if err != nil {
 			logger.Fatal(err.Error())
 		}
-		return NewOtelMetricsHandler(logger, otelProvider, c.ClientConfig, c.ClientConfig.RecordTimerInSeconds)
+		handler, err = NewOtelMetricsHandler(logger, otelProvider, c.ClientConfig, c.ClientConfig.RecordTimerInSeconds)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// fallback to tally if no framework is specified
+		handler = NewTallyMetricsHandler(
+			c.ClientConfig,
+			NewScope(logger, c),
+		)
 	}
 
-	// fallback to tally if no framework is specified
-	return NewTallyMetricsHandler(
-		c.ClientConfig,
-		NewScope(logger, c),
-	), nil
+	// Apply metrics filtering if allowedMetrics is configured
+	if len(c.ClientConfig.AllowedMetrics) > 0 {
+		// Build allowed metrics map
+		allowedMap := make(map[string]bool, len(c.ClientConfig.AllowedMetrics))
+		for _, name := range c.ClientConfig.AllowedMetrics {
+			if name != "" {
+				allowedMap[name] = true
+			}
+		}
+		logger.Info("Loaded metrics allowlist", tag.NewInt("count", len(allowedMap)))
+		handler = NewFilteredMetricsHandler(handler, allowedMap, logger)
+	}
+
+	return handler, nil
 }
 
 func configExcludeTags(cfg ClientConfig) map[string]map[string]struct{} {
